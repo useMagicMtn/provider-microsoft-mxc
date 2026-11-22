@@ -1,0 +1,45 @@
+[package]
+name = "magicmtn-provider-microsoft-mxc"
+version = "0.1.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Microsoft MXC process sandbox provider for MagicMtn"
+readme = "README.md"
+include = [
+    "src/**",
+    "tests/**",
+    "examples/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CONTRIBUTING.md",
+    "AGENTS.md",
+    "LICENSE",
+    "package.sh",
+    "package.py",
+    "USAGE.md",
+    ".github/assets/*.svg",
+]
+
+[[bin]]
+name = "magicmtn-provider-microsoft-mxc"
+path = "src/main.rs"
+required-features = ["plugin"]
+
+[features]
+default = ["plugin"]
+plugin = ["dep:magicmtn-provider-framework", "tokio/macros", "tokio/rt"]
+
+[dependencies]
+anyhow = "1"
+fs2 = "0.4"
+magicmtn-provider-framework = { version = "0.1.0", optional = true }
+magicmtn-sdk = "0.1.0"
+mxc-sdk = "=1.0.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
