@@ -19,4 +19,20 @@ Pass the policy file's path as the template argument to `SandboxBackend::create`
 
 Include any extra tool directories, such as `/opt/homebrew`, in `readonly_paths` when needed, and invoke executables by their full paths if they are outside the sandbox's PATH. MXC also grants backend-specific baseline access to system and runtime files. Only the session workspace is writable; host source directories remain read-only.
 
-The template contract accepts JSON policy files. Dockerfiles, OCI layouts, and `image:<reference>|<session>` templates are unsupported by these host process backends. A harness using the image convention or requiring a resident background agent needs a different integration. Installing the provider package does not itself configure a compute selection or harness.
+## SDK workflow
+
+Use the current public SDK pinned in [SDK_REVISION](SDK_REVISION). The executable speaks protocol v1 and advertises `create`, `status`, `terminate`, `exec`, and `exec_bounded`. Describe and shutdown work with an empty environment and perform no state initialization, backend detection, or sandbox launch. State is selected and initialized on the first workspace operation and shared by subsequent operations and library clones.
+
+For a local Rust application, follow [CONTRIBUTING.md](CONTRIBUTING.md#development-setup) to configure the SDK paths, then run the workspace example:
+
+```sh
+cargo run --locked --example workspace -- /absolute/path/to/policy.json
+```
+
+The example creates a session, checks its status, executes a host-native command, and removes the session even if execution fails. For embedding, use `MxcProvider::new(private_state_directory)` or `MxcProvider::from_env()`. `MxcProvider::deferred_from_env()` selects state on the first workspace operation and supports state-free executable discovery.
+
+An SDK host passes the local policy file path in `Operation::SandboxCreate` and retains the returned `ProviderSandbox` for later operations. Keep the provider's state directory stable across host restarts. `Operation::SandboxStatus` reads the saved policy and workspace under the session lock: `running` means the workspace session is available, and `missing` means it has been removed or its identifier is unknown. Malformed state, a different saved platform or format version, a changed workspace identity, and filesystem failures return errors. Each command has a separate contained process lifetime.
+
+Termination is idempotent for removed and unknown session identifiers. It leaves existing lock tombstones in place so stale callers remain serialized. Status uses saved state rather than caller-editable metadata.
+
+MXC's template is a host-local JSON policy. Its process sandboxes execute the host's programs using Seatbelt, Bubblewrap, or ProcessContainer. Use the image preparation and OCI layout APIs with image-based providers; MXC reports those operations as `unsupported_operation` and keeps them outside its advertised capabilities.

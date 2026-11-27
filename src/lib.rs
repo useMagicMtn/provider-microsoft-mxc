@@ -2,8 +2,10 @@
 //! Each exec creates a fresh contained process tree; no resident VM or daemon.
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
-use magicmtn_sdk::plugin::{ErrorCode, ProviderError};
-use magicmtn_sdk::{BoxFuture, ExecResult, ProviderSandbox, SandboxBackend, ScpDirection};
+use magicmtn_sdk::plugin::{Capabilities, ErrorCode, ProviderError, SandboxOperation};
+use magicmtn_sdk::{
+    BoxFuture, ExecResult, ProviderSandbox, SandboxBackend, SandboxState, ScpDirection,
+};
 use mxc_sdk::v1::{self as mxc, ContainerRequest, Containment, WaitResult};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -11,11 +13,17 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub fn capabilities() -> Capabilities {
+    use SandboxOperation::*;
+    Capabilities::sandbox(vec![Create, Status, Terminate, Exec, ExecBounded])
+}
 
 /// Trusted server-local template. Only the session workspace is writable.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -38,7 +46,7 @@ struct Session {
 /// The state directory must be private to the MagicMtn server account.
 #[derive(Debug, Clone)]
 pub struct MxcProvider {
-    root: PathBuf,
+    root: Arc<OnceLock<PathBuf>>,
 }
 
 impl MxcProvider {
@@ -47,7 +55,9 @@ impl MxcProvider {
         let root = root.as_ref().canonicalize()?;
         private_dir(&root.join("sessions"))?;
         private_dir(&root.join("locks"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root: Arc::new(OnceLock::from(root)),
+        })
     }
 
     pub fn from_env() -> Result<Self> {
@@ -66,6 +76,30 @@ impl MxcProvider {
             .join(".local/share/magicmtn/mxc")
         };
         Self::new(root)
+    }
+
+    /// Defer environment and filesystem access until a workspace operation.
+    /// Discovery and shutdown can run without state configuration or host tools.
+    pub fn deferred_from_env() -> Self {
+        Self {
+            root: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn root(&self) -> Result<&Path> {
+        if self.root.get().is_none() {
+            let initialized = Self::from_env()?;
+            let root = initialized
+                .root
+                .get()
+                .context("MXC state was not initialized")?;
+            // Concurrent initializers select the same immutable process environment.
+            let _ = self.root.set(root.clone());
+        }
+        self.root
+            .get()
+            .map(PathBuf::as_path)
+            .context("MXC state was not initialized")
     }
 
     fn id(sandbox: &ProviderSandbox) -> Result<Uuid> {
@@ -88,14 +122,69 @@ impl MxcProvider {
             .read(true)
             .write(true)
             .create(create)
-            .open(self.root.join("locks").join(format!("{id}.lock")))
+            .open(self.root()?.join("locks").join(format!("{id}.lock")))
             .context("unknown MXC session")?;
         FileExt::lock_exclusive(&file)?;
         Ok(file)
     }
 
-    fn session_dir(&self, id: Uuid) -> PathBuf {
-        self.root.join("sessions").join(id.to_string())
+    fn session_dir(&self, id: Uuid) -> Result<PathBuf> {
+        Ok(self.root()?.join("sessions").join(id.to_string()))
+    }
+
+    // Unknown IDs are absent only when both the lock and session are absent.
+    // Other filesystem errors and orphaned session directories remain errors.
+    fn lock_existing(&self, id: Uuid) -> Result<Option<File>> {
+        match self.lock(id, false) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                match fs::symlink_metadata(self.session_dir(id)?) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error.into()),
+                    Ok(_) => bail!("MXC session lock is missing"),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn load_session(&self, id: Uuid) -> Result<(Session, PathBuf)> {
+        let dir = self.session_dir(id)?;
+        ensure!(
+            fs::symlink_metadata(&dir)?.is_dir(),
+            "MXC session identity changed"
+        );
+        let session: Session = serde_json::from_slice(&read_small(&dir.join("policy.json"))?)?;
+        ensure!(
+            session.version == 1 && session.platform == std::env::consts::OS,
+            "incompatible MXC session state"
+        );
+        let workspace = dir.join("workspace").canonicalize()?;
+        ensure!(
+            workspace == dir.join("workspace"),
+            "workspace identity changed"
+        );
+        Ok((session, workspace))
+    }
+
+    fn status_sync(&self, sandbox: &ProviderSandbox) -> Result<SandboxState> {
+        let id = Self::id(sandbox)?;
+        let Some(_lock) = self.lock_existing(id)? else {
+            return Ok(SandboxState::Missing);
+        };
+        match fs::symlink_metadata(self.session_dir(id)?) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SandboxState::Missing),
+            Err(error) => Err(error.into()),
+            Ok(_) => {
+                self.load_session(id)?;
+                // Running denotes an available workspace session; commands run separately.
+                Ok(SandboxState::Running)
+            }
+        }
     }
 
     fn create_sync(&self, template: &str) -> Result<ProviderSandbox> {
@@ -117,7 +206,7 @@ impl MxcProvider {
             ensure!(path.is_absolute(), "policy paths must be absolute");
             *path = path.canonicalize().context("policy path does not exist")?;
             ensure!(
-                !self.root.starts_with(&*path) && !path.starts_with(&self.root),
+                !self.root()?.starts_with(&*path) && !path.starts_with(self.root()?),
                 "policy paths must not overlap provider state"
             );
         }
@@ -130,7 +219,7 @@ impl MxcProvider {
         );
         let id = Uuid::new_v4();
         let _lock = self.lock(id, true)?;
-        let dir = self.session_dir(id);
+        let dir = self.session_dir(id)?;
         private_dir(&dir)?;
         let result = (|| {
             private_dir(&dir.join("workspace"))?;
@@ -182,17 +271,7 @@ impl MxcProvider {
         );
         let id = Self::id(sandbox)?;
         let _lock = self.lock(id, false)?;
-        let dir = self.session_dir(id);
-        let session: Session = serde_json::from_slice(&read_small(&dir.join("policy.json"))?)?;
-        ensure!(
-            session.version == 1 && session.platform == std::env::consts::OS,
-            "incompatible MXC session state"
-        );
-        let workspace = dir.join("workspace").canonicalize()?;
-        ensure!(
-            workspace == dir.join("workspace"),
-            "workspace identity changed"
-        );
+        let (session, workspace) = self.load_session(id)?;
         let mut request = ContainerRequest::new(command_line(command, args, cfg!(windows)));
         request.containment = match backend()? {
             "seatbelt" => Containment::Seatbelt(Default::default()),
@@ -305,6 +384,15 @@ impl MxcProvider {
     }
 }
 
+fn unsupported_image() -> anyhow::Error {
+    ProviderError {
+        code: ErrorCode::UnsupportedOperation,
+        retryable: false,
+        message: "MXC uses host-native JSON policy templates".into(),
+    }
+    .into()
+}
+
 fn backend() -> Result<&'static str> {
     match std::env::consts::OS {
         "macos" => Ok("seatbelt"),
@@ -411,6 +499,27 @@ fn capture(mut reader: impl Read, limit: usize) -> Result<(String, bool)> {
 }
 
 impl SandboxBackend for MxcProvider {
+    fn status<'a>(&'a self, sandbox: &'a ProviderSandbox) -> BoxFuture<'a, SandboxState> {
+        let provider = self.clone();
+        let sandbox = sandbox.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || provider.status_sync(&sandbox))
+                .await?
+                .map_err(rpc_error)
+        })
+    }
+
+    fn prepare_image<'a>(
+        &'a self,
+        _: &'a std::collections::BTreeMap<String, magicmtn_sdk::image_registry::Image>,
+    ) -> BoxFuture<'a, magicmtn_sdk::image_registry::PreparedImage> {
+        Box::pin(async { Err(unsupported_image()) })
+    }
+
+    fn create_from_image<'a>(&'a self, _: &'a Path) -> BoxFuture<'a, ProviderSandbox> {
+        Box::pin(async { Err(unsupported_image()) })
+    }
+
     fn create<'a>(&'a self, template: &'a str) -> BoxFuture<'a, ProviderSandbox> {
         let provider = self.clone();
         let template = template.to_owned();
@@ -426,8 +535,10 @@ impl SandboxBackend for MxcProvider {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 let id = Self::id(&sandbox)?;
-                let _lock = provider.lock(id, false)?;
-                match fs::remove_dir_all(provider.session_dir(id)) {
+                let Some(_lock) = provider.lock_existing(id)? else {
+                    return Ok(());
+                };
+                match fs::remove_dir_all(provider.session_dir(id)?) {
                     Ok(()) => Ok(()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     Err(e) => Err(e.into()),
@@ -546,5 +657,133 @@ mod tests {
                 .is_err()
             );
         }
+    }
+    fn saved_session(provider: &MxcProvider) -> ProviderSandbox {
+        let id = Uuid::new_v4();
+        let _lock = provider.lock(id, true).unwrap();
+        let dir = provider.session_dir(id).unwrap();
+        private_dir(&dir.join("workspace")).unwrap();
+        fs::write(
+            dir.join("policy.json"),
+            serde_json::to_vec(&Session {
+                version: 1,
+                platform: std::env::consts::OS.into(),
+                template: Template::default(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        ProviderSandbox {
+            provider_id: format!("mxc-{id}"),
+            status: None,
+            create_time_ms: None,
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_and_removal_use_durable_state_across_provider_instances() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = MxcProvider::new(tmp.path().join("state")).unwrap();
+        let sandbox = saved_session(&provider);
+        assert_eq!(
+            provider.status(&sandbox).await.unwrap(),
+            SandboxState::Running
+        );
+        let restarted = MxcProvider::new(tmp.path().join("state")).unwrap();
+        assert_eq!(
+            restarted.status(&sandbox).await.unwrap(),
+            SandboxState::Running
+        );
+        restarted.terminate(&sandbox).await.unwrap();
+        assert_eq!(
+            provider.status(&sandbox).await.unwrap(),
+            SandboxState::Missing
+        );
+        provider.terminate(&sandbox).await.unwrap();
+        let unknown = ProviderSandbox {
+            provider_id: format!("mxc-{}", Uuid::new_v4()),
+            ..sandbox
+        };
+        assert_eq!(
+            provider.status(&unknown).await.unwrap(),
+            SandboxState::Missing
+        );
+        provider.terminate(&unknown).await.unwrap();
+        assert_eq!(
+            fs::read_dir(provider.root().unwrap().join("locks"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn damaged_state_is_an_error_instead_of_a_missing_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = MxcProvider::new(tmp.path().join("state")).unwrap();
+        let sandbox = saved_session(&provider);
+        let id = MxcProvider::id(&sandbox).unwrap();
+        let dir = provider.session_dir(id).unwrap();
+        for body in [
+            "invalid".to_owned(),
+            json!({"version":2,"platform":std::env::consts::OS,"template":{}}).to_string(),
+            json!({"version":1,"platform":"another-host","template":{}}).to_string(),
+        ] {
+            fs::write(dir.join("policy.json"), body).unwrap();
+            assert!(provider.status(&sandbox).await.is_err());
+        }
+        fs::remove_file(dir.join("policy.json")).unwrap();
+        assert!(provider.status(&sandbox).await.is_err());
+        fs::remove_file(
+            provider
+                .root()
+                .unwrap()
+                .join("locks")
+                .join(format!("{id}.lock")),
+        )
+        .unwrap();
+        assert!(provider.status(&sandbox).await.is_err());
+        assert!(provider.terminate(&sandbox).await.is_err());
+        assert!(dir.exists());
+    }
+
+    #[tokio::test]
+    async fn image_contracts_fail_explicitly_without_initializing_state() {
+        let provider = MxcProvider::deferred_from_env();
+        let error = provider
+            .prepare_image(&Default::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProviderError>().unwrap().code,
+            ErrorCode::UnsupportedOperation
+        );
+        let error = provider
+            .create_from_image(Path::new("unused"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProviderError>().unwrap().code,
+            ErrorCode::UnsupportedOperation
+        );
+        assert!(provider.root.get().is_none());
+    }
+    #[tokio::test]
+    async fn a_missing_workspace_does_not_make_an_existing_session_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = MxcProvider::new(tmp.path().join("state")).unwrap();
+        let sandbox = saved_session(&provider);
+        let dir = provider
+            .session_dir(MxcProvider::id(&sandbox).unwrap())
+            .unwrap();
+        fs::remove_dir(dir.join("workspace")).unwrap();
+        assert!(provider.status(&sandbox).await.is_err());
+        assert!(dir.join("policy.json").is_file());
+        provider.terminate(&sandbox).await.unwrap();
+        assert_eq!(
+            provider.status(&sandbox).await.unwrap(),
+            SandboxState::Missing
+        );
     }
 }

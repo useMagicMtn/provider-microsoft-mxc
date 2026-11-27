@@ -19,11 +19,11 @@ Install the provider on the host running your MagicMtn server. MXC is included i
 | Linux       | Bubblewrap       | `bwrap` 0.5+ on PATH and working unprivileged user namespaces                                                                                               |
 | Windows     | ProcessContainer | A supported Windows 11 build; see [MXC's OS requirements](https://github.com/microsoft/mxc/blob/main/docs/backends/process-container/os-version-support.md) |
 
-Use a client that creates sandboxes from a local JSON policy file and runs host-native commands. Clients that require OCI images or a persistent background sandbox agent need a provider that supports those workloads.
+Create sandboxes from a local JSON policy file through a MagicMtn SDK host or the Rust library. See the [SDK workflow](USAGE.md#sdk-workflow) for a complete workspace session.
 
 ## Installation and configuration
 
-On an Apple Silicon Mac, install from the [MagicMtn Registry](https://control.magicmtn.ai/registry/microsoft-mxc):
+On an Apple Silicon Mac, install from the [MagicMtn Registry](https://magicmtn.ai/registry/microsoft-mxc):
 
 ```sh
 magic provider install microsoft-mxc
@@ -37,9 +37,11 @@ Set `MAGICMTN_MXC_STATE_DIR` in the server environment to choose where workspace
 
 ## Runtime behavior
 
-The provider supports creation, termination, and bounded command execution. Each command runs in a fresh process sandbox with the workspace as its working directory. Workspace files persist across commands and server restarts; background processes do not persist between executions.
+The provider supports creation, status, termination, and bounded command execution. Each command runs in a fresh process sandbox with the workspace as its working directory. Workspace files persist across commands and server restarts; background processes do not persist between executions.
 
 Only the workspace is writable. Networking and UI access are disabled, and host credentials are not forwarded. Commands can read the paths allowed by your policy and the backend's baseline system access. Isolation uses the host operating system's process controls rather than a virtual machine.
+
+Status reads saved workspace and policy state, so sessions can be inspected after a provider restart. An available workspace reports `running`; a removed workspace reports `missing`.
 
 Commands have time and output limits. Terminating a session removes its workspace and prevents further execution. SSH and SCP are not supported.
 

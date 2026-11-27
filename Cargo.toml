@@ -1,6 +1,6 @@
 [package]
 name = "magicmtn-provider-microsoft-mxc"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Microsoft MXC process sandbox provider for MagicMtn"
@@ -9,6 +9,8 @@ include = [
     "src/**",
     "tests/**",
     "examples/**",
+    "SDK_REVISION",
+    ".cargo/config.toml.example",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
@@ -20,6 +22,9 @@ include = [
     "USAGE.md",
     ".github/assets/*.svg",
 ]
+
+[package.metadata.magicmtn]
+protocol-version = 1
 
 [[bin]]
 name = "magicmtn-provider-microsoft-mxc"
@@ -42,4 +47,5 @@ tokio = { version = "1", features = ["rt", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+magicmtn-provider-framework = { version = "0.1.0", features = ["host"] }
 tempfile = "3"

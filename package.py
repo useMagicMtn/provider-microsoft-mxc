@@ -15,7 +15,7 @@ name = crate["name"].removeprefix("magicmtn-provider-")
 host_os = {"Darwin": "macos", "Linux": "linux", "Windows": "windows"}[platform.system()]
 arch = {"arm64": "aarch64", "ARM64": "aarch64", "aarch64": "aarch64", "x86_64": "x86_64", "AMD64": "x86_64"}[platform.machine()]
 exe = root / "target" / "release" / (crate["name"] + (".exe" if host_os == "windows" else ""))
-manifest = dict(name=name, version=crate["version"], protocol_version=1, os=host_os,
+manifest = dict(name=name, version=crate["version"], protocol_version=crate["metadata"]["magicmtn"]["protocol-version"], os=host_os,
                 arch=arch, sha256=hashlib.sha256(exe.read_bytes()).hexdigest())
 (root / "dist").mkdir(exist_ok=True)
 output = root / "dist" / f"{name}-{crate['version']}-{host_os}-{arch}.tar.gz"

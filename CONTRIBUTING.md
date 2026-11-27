@@ -14,12 +14,10 @@ src/
   provider-microsoft-mxc/
 ```
 
-Create an ignored `.cargo/config.toml` with these patches:
+Check out the public SDK revision recorded in [SDK_REVISION](SDK_REVISION). Copy the example patches into an ignored local Cargo configuration:
 
-```toml
-[patch.crates-io]
-magicmtn-sdk = { path = "../magicmtn/sdk/rust/magicmtn-sdk" }
-magicmtn-provider-framework = { path = "../magicmtn/sdk/rust/magicmtn-provider-framework" }
+```sh
+cp .cargo/config.toml.example .cargo/config.toml
 ```
 
 Adjust the paths for your checkout layout, then build:
@@ -32,22 +30,22 @@ The manifest declares versioned SDK dependencies, while the current lockfile res
 
 ## Architecture
 
-- `src/main.rs` runs the persistent JSON RPC service and advertises creation, termination, exec, and bounded exec.
-- `src/lib.rs` implements `SandboxBackend`, native MXC launch, policy validation, durable workspaces, session locking, and output capture. Its unit tests cover argument quoting, output bounds, and invalid templates and session IDs.
-- `tests/protocol.rs` checks discovery, capabilities, invalid creation, unsupported SSH, and shutdown through the executable.
+- `src/main.rs` runs the persistent JSON RPC service and advertises creation, status, termination, exec, and bounded exec.
+- `src/lib.rs` implements `SandboxBackend`, native MXC launch, policy validation, durable workspaces, session locking, and output capture. Its unit tests cover argument quoting, output bounds, invalid templates and session IDs, durable status, and damaged state.
+- `tests/protocol.rs` checks discovery, capabilities, state-free startup, saved session status, removal, invalid creation, unsupported SSH, and shutdown through the executable.
 - `tests/containment.rs` contains opt-in tests that launch real native sandboxes.
 - `examples/policy.json` provides an empty host-access policy.
 - `package.py` builds and packages a native executable; `package.sh` invokes it on Unix.
 
 The default `plugin` feature builds the RPC executable. For library embedding, disable default features and construct `MxcProvider::new(private_state_directory)`. The provider selects Seatbelt on macOS, Bubblewrap on Linux, and ProcessContainer on Windows. Other MXC backends are not exposed, and a failed contained launch never falls back to an uncontained process.
 
-Provider startup initializes its state directory, so discovery needs writable private state and either `MAGICMTN_MXC_STATE_DIR` or the platform's default-location environment variable. Discovery does not launch a sandbox; creation checks backend availability, and each execution asks MXC to enforce the policy.
+The executable constructs `MxcProvider::deferred_from_env()`. Discovery and shutdown perform no environment or filesystem setup. The first workspace operation initializes and pins the state directory using `MAGICMTN_MXC_STATE_DIR` or the platform default. Explicit library construction with `new` or `from_env` retains immediate initialization. Creation checks backend availability, and each execution asks MXC to enforce the policy.
 
 ## Lifecycle and execution
 
 State contains `sessions/<UUID>/policy.json`, `sessions/<UUID>/workspace/`, and `locks/<UUID>.lock`. Session IDs have the form `mxc-<canonical UUID>`. Saved policy includes a format version and host platform, which execution checks before launch. Preserve the state directory across runner restarts and upgrades while sessions remain active.
 
-Each execution starts a fresh contained process tree using the saved policy and workspace as its working directory. Files persist between executions; process state and background services do not. Status, interactive SSH, and SCP are not advertised. The SSH and SCP trait methods remain required unsupported-operation implementations.
+Each execution starts a fresh contained process tree using the saved policy and workspace as its working directory. Files persist between executions; process state and background services do not. Status validates the durable session under its existing lock. It reports `running` for a valid available workspace and `missing` for a removed or unknown session, and preserves errors for damaged state or failed filesystem access. Interactive SSH and SCP are not advertised. The SSH and SCP trait methods remain required unsupported-operation implementations.
 
 Execution and termination take the same exclusive per-session file lock across provider processes. Termination waits for an active execution, removes the session directory, and revokes future execution. Repeating termination of a previously created session succeeds. Lock files remain as small tombstones so stale callers coordinate through the same inode; do not remove them while callers may still hold them.
 
@@ -78,7 +76,7 @@ cargo test --locked --test containment -- --ignored
 
 Native tests cover workspace persistence across provider instances, teardown, and revocation. Unix tests also exercise filesystem and network denial, read-only and denied paths, argument quoting, output pressure, timeouts, and cleanup of background processes holding pipes. Report native results by operating system; a unit-test pass does not establish native containment support.
 
-The existing GitHub Actions workflow runs formatting, lint, and unit/protocol checks on macOS, Linux, and Windows, plus native containment tests on macOS and Linux. Windows native tests require a supported Windows 11 host. CI obtains the SDK from `MAGICMTN_SDK_REPOSITORY` and `MAGICMTN_SDK_REF` repository variables, falling back to the owner's `MagicMtn` repository when no repository override is set. Its local patch paths match that CI checkout layout.
+The existing GitHub Actions workflow runs formatting, lint, and unit/protocol checks on macOS, Linux, and Windows, plus native containment tests on macOS and Linux. Windows native tests require a supported Windows 11 host. CI checks out the public `useMagicMtn/magicmtn` repository at [SDK_REVISION](SDK_REVISION) and copies the example Cargo patches. `MAGICMTN_SDK_REPOSITORY` and `MAGICMTN_SDK_REF` repository variables can select a compatible test revision. Its local patch paths match the sibling checkout layout.
 
 ## Packaging and releases
 
@@ -95,7 +93,7 @@ The output is `dist/microsoft-mxc-<version>-<os>-<arch>.tar.gz`, containing `pro
 Install the matching archive on the MagicMtn server host. For example, on an Apple Silicon Mac:
 
 ```sh
-magic provider install --file dist/microsoft-mxc-0.1.1-macos-aarch64.tar.gz
+magic provider install --file dist/microsoft-mxc-0.2.0-macos-aarch64.tar.gz
 ```
 
 Before publishing a release, verify discovery, archive contents, checksum, and a native create/execute/terminate cycle on each advertised platform. Use new versions and digests for changed released binaries and retain previous releases for existing session bindings. Preserve the Apache-2.0 license and keep local configuration, private templates, and session state out of distributions.

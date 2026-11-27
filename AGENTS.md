@@ -31,7 +31,8 @@ Run checks relevant to the change. Runtime changes need default-feature and libr
 
 ## Compatibility and runtime changes
 
-- Preserve create, terminate, exec, and bounded exec capabilities. Do not advertise status, SSH, or SCP without implementing their contracts. Required unsupported trait methods are not dead code.
+- Preserve create, status, terminate, exec, and bounded exec capabilities. Status observes durable workspace sessions under the session lock. Do not advertise SSH, SCP, or image preparation without implementing their contracts. Required unsupported trait methods are not dead code.
+- Keep discovery and shutdown independent of state initialization, environment configuration, and native backend availability.
 - Keep the selected Seatbelt, Bubblewrap, and ProcessContainer backends. Never fall back to an uncontained process.
 - Preserve strict template validation, canonical session IDs, saved policy version/platform checks, and rejection of paths overlapping provider state. Do not silently add OCI or Dockerfile support.
 - Preserve private workspaces, the explicit child environment, closed stdin, network/UI denial, and separately quoted arguments. Review containment changes against native tests on affected platforms.

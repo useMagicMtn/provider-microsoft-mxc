@@ -1,5 +1,5 @@
 use magicmtn_provider_microsoft_mxc::MxcProvider;
-use magicmtn_sdk::{ProviderSandbox, SandboxBackend};
+use magicmtn_sdk::{ProviderSandbox, SandboxBackend, SandboxState};
 use serde_json::json;
 
 async fn session() -> (tempfile::TempDir, MxcProvider, ProviderSandbox) {
@@ -39,6 +39,10 @@ async fn workspace_survives_restart_and_termination_revokes_execution() {
             .unwrap()
             .contains("hello")
     );
+    assert_eq!(
+        provider.status(&sandbox).await.unwrap(),
+        SandboxState::Running
+    );
     // Neither editable metadata nor the original template controls later exec.
     sandbox.metadata = Some(json!({"workspace":"/", "network":"allow"}));
     std::fs::write(tmp.path().join("policy.json"), "invalid").unwrap();
@@ -57,7 +61,15 @@ async fn workspace_survives_restart_and_termination_revokes_execution() {
             .unwrap()
             .contains("persisted")
     );
+    assert_eq!(
+        restarted.status(&sandbox).await.unwrap(),
+        SandboxState::Running
+    );
     restarted.terminate(&sandbox).await.unwrap();
+    assert_eq!(
+        restarted.status(&sandbox).await.unwrap(),
+        SandboxState::Missing
+    );
     restarted.terminate(&sandbox).await.unwrap();
     assert!(restarted.exec(&sandbox, program, &args).await.is_err());
 }
